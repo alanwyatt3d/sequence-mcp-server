@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: sequence-mcp-server
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: "/health"
+    envVars:
+      # These environment variables should be configured via the Render dashboard.
+      - key: SEQUENCE_ACCESS_TOKEN
+        sync: false
+      - key: SEQUENCE_RULE_SECRETS_JSON
+        sync: false
+      - key: MCP_ADMIN_TOKEN
+        sync: false
+      - key: SWEEP_CHECKING_BUFFER
+        value: "1000"
+      - key: SWEEP_PERCENT
+        value: "0.30"
+      - key: SWEEP_DAILY_CAP_CENTS
+        value: "30000"
