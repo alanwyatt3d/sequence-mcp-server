@@ -5,6 +5,7 @@ import json
 import httpx
 import asyncio
 import time
+from typing import Any
 
 # This FastAPI application implements a minimal MCP server for Sequence
 # integration. It supports read-only MCP tools (search and fetch) for
@@ -53,13 +54,10 @@ async def sse(request: Request):
     until the client disconnects.
     """
     async def event_stream():
-        # Initial hello so the client sees content immediately
         yield "event: ready\ndata: ok\n\n"
         while True:
-            # Stop streaming if client disconnects
             if await request.is_disconnected():
                 break
-            # Periodic heartbeat with a timestamp
             yield f"event: heartbeat\ndata: {int(time.time())}\n\n"
             await asyncio.sleep(15)
 
@@ -74,11 +72,7 @@ async def sse(request: Request):
 # Helper: fetch accounts from Sequence
 # ---------------------------------------------------------------------
 async def seq_accounts() -> list:
-    """Retrieve account data from Sequence via the remote API.
-
-    Uses the SEQUENCE_ACCESS_TOKEN for authentication. Raises an error
-    if the token is missing or if the request fails.
-    """
+    """Retrieve account data from Sequence via the remote API."""
     if not ACCESS:
         raise HTTPException(500, "SEQUENCE_ACCESS_TOKEN missing")
     async with httpx.AsyncClient(timeout=20) as client:
@@ -92,48 +86,40 @@ async def seq_accounts() -> list:
         )
         response.raise_for_status()
         body = response.json()
-        # Defensive: some errors are reported under data/errors
         return (body.get("data") or {}).get("accounts", [])
 
 # ---------------------------------------------------------------------
-# MCP tools
+# MCP tools (canonical implementations)
 # ---------------------------------------------------------------------
 @app.post("/mcp/search")
 async def mcp_search(payload: dict) -> dict:
-    """MCP search tool implementation.
-
-    Accepts a JSON payload with a "query" key and returns up to 10 results
-    matching the query from the Sequence accounts list. Each result
-    includes an ID, title, and URL.
+    """
+    Accepts JSON with {"query": "..."} and returns up to 10 Sequence
+    accounts as {"content":[{"type":"text","text": "{\"results\":[...]}" }]}.
     """
     query = (payload.get("query") or "").lower()
     accounts = await seq_accounts()
     results = []
     for account in accounts:
-        # Include accounts when the query is empty, matches the name, or matches the ID.
         if (
             not query
             or query in account["name"].lower()
             or query in str(account["id"]).lower()
             or query in ("balances", "accounts")
         ):
-            # Some accounts might not have balance due to provider errors
             bal = account.get("balance", {}) or {}
             amt = bal.get("amountInDollars")
             title = f"{account['name']} — ${amt}" if amt is not None else account["name"]
             url = f"https://app.getsequence.io/accounts/{account['id']}"
             results.append({"id": str(account["id"]), "title": title, "url": url})
-    # Limit to 10 results for brevity
     content = json.dumps({"results": results[:10]})
     return {"content": [{"type": "text", "text": content}]}
 
 @app.post("/mcp/fetch")
 async def mcp_fetch(payload: dict) -> dict:
-    """MCP fetch tool implementation.
-
-    Given an ID, returns the full record for that account or a placeholder
-    description for rules. The response always returns a single text content
-    item containing JSON.
+    """
+    Accepts JSON with {"id":"..."} and returns a single document object
+    inside a text content item.
     """
     record_id = (payload.get("id") or "").strip()
     accounts = await seq_accounts()
@@ -146,7 +132,6 @@ async def mcp_fetch(payload: dict) -> dict:
             "url": f"https://app.getsequence.io/accounts/{match['id']}",
         }
         return {"content": [{"type": "text", "text": json.dumps(doc)}]}
-    # If not an account, and ID looks like a rule, return a simple descriptor
     if record_id.startswith("ru_"):
         doc = {
             "id": record_id,
@@ -155,20 +140,60 @@ async def mcp_fetch(payload: dict) -> dict:
             "url": f"https://app.getsequence.io/rules/{record_id}",
         }
         return {"content": [{"type": "text", "text": json.dumps(doc)}]}
-    # Otherwise, return a not-found error
     raise HTTPException(404, "Not found")
+
+# ---------------------------------------------------------------------
+# ChatGPT-facing wrappers (paths ChatGPT expects)
+# ---------------------------------------------------------------------
+def _normalize_payload(body: Any) -> dict:
+    """
+    Accepts either a JSON object or a raw string body and normalizes it.
+    - For /search: raw string -> {"query": raw}
+    - For /fetch:  raw string -> {"id": raw}
+    """
+    if isinstance(body, dict):
+        return body
+    # If body is already bytes/str from an upstream middleware, try to parse
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return {"raw": body.decode("utf-8", "ignore")}
+    if isinstance(body, str):
+        # Caller decides which key to read (search uses 'query', fetch uses 'id')
+        return {"raw": body}
+    return {}
+
+@app.post("/search")
+async def search(body: Any) -> dict:
+    """
+    Wrapper for MCP search tool; supports either:
+      - {"query": "<string>"}  (JSON)
+      - "<string>"              (raw body)
+    """
+    payload = _normalize_payload(body)
+    if "query" not in payload and "raw" in payload:
+        payload = {"query": payload["raw"]}
+    return await mcp_search(payload)
+
+@app.post("/fetch")
+async def fetch(body: Any) -> dict:
+    """
+    Wrapper for MCP fetch tool; supports either:
+      - {"id": "<string>"}  (JSON)
+      - "<string>"          (raw body)
+    """
+    payload = _normalize_payload(body)
+    if "id" not in payload and "raw" in payload:
+        payload = {"id": payload["raw"]}
+    return await mcp_fetch(payload)
 
 # ---------------------------------------------------------------------
 # Sequence: Query Remote API amount calculator
 # ---------------------------------------------------------------------
 @app.post("/remote/amount")
 async def remote_amount(payload: dict) -> dict:
-    """Endpoint for Sequence's Query Remote API to compute transfer amounts.
-
-    Expects the payload to contain the current checking balance. Calculates
-    the amount to transfer in cents based on the buffer, percentage, and
-    daily cap. Returns a JSON response with the amount in cents.
-    """
+    """Endpoint for Sequence's Query Remote API to compute transfer amounts."""
     balance = float(payload.get("checkingBalance", 0))
     excess = max(0.0, balance - BUFFER)
     transfer_cents = int(min(excess * PCT * 100, CAP))
@@ -179,26 +204,19 @@ async def remote_amount(payload: dict) -> dict:
 # ---------------------------------------------------------------------
 @app.post("/rules/{rule_id}/trigger")
 async def trigger_rule(rule_id: str, request: Request, x_admin: str = Header(None)) -> dict:
-    """Protected endpoint to trigger a Sequence rule.
-
-    Requires the x-admin header matching MCP_ADMIN_TOKEN and the rule ID
-    must be in RULE_SECRETS. Uses the rule's secret to call Sequence's
-    remote API trigger endpoint. Returns the JSON response from Sequence
-    on success.
     """
-    # Check admin token
+    Protected endpoint to trigger a Sequence rule using RULE_SECRETS and MCP_ADMIN_TOKEN.
+    """
     if not x_admin or not x_admin.startswith("Bearer "):
         raise HTTPException(401, "Unauthorized")
     token_value = x_admin.split(" ", 1)[1]
     if token_value != ADMIN:
         raise HTTPException(403, "Forbidden")
 
-    # Find the secret for the rule
     secret = RULE_SECRETS.get(rule_id)
     if not secret:
         raise HTTPException(403, "Rule not whitelisted")
 
-    # Call Sequence trigger endpoint
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
             f"{SEQUENCE_API}/remote-api/rules/{rule_id}/trigger",
